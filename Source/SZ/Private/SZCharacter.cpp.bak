@@ -1,0 +1,399 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+
+#include "SZCharacter.h"
+#include "SZPlayerAnimInstance.h"
+#include "SZWeaponBase.h"
+#include "XRMotionControllerBase.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "HeadMountedDisplayFunctionLibrary.h"
+#include "SZCharacterListSetting.h" // 테스트용 1
+#include "SZPlayerState.h"
+
+// Sets default values
+ASZCharacter::ASZCharacter()
+{
+ 	// Set this character to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
+	PrimaryActorTick.bCanEverTick = true;
+
+	bReplicates = true;
+
+	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SPRINGARM"));
+	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("CAMERA"));
+
+	TTPMesh = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("MESH"));
+
+	VR_Origin = CreateDefaultSubobject<USceneComponent>(TEXT("VROrigin"));
+
+	const FTransform SpawnTransform = FTransform(FRotator(0.0f, 0.0f, 0.0f), FVector(0.0f, 0.0f, 0.0f), FVector(1.0f, 1.0f, 1.0f)); // = FTransform::Identity;
+	FAttachmentTransformRules AttachRules(EAttachmentRule::SnapToTarget, EAttachmentRule::SnapToTarget, EAttachmentRule::KeepWorld, false);
+
+	MotionController_Left = CreateDefaultSubobject<USZMotionHandController>(TEXT("Motion_L"));
+	MotionController_Left->MotionSource = FXRMotionControllerBase::LeftHandSourceId; // 블루프린트는 Enum
+	MotionController_Left->SetCollisionProfileName(TEXT("NoCollision"));
+	MotionController_Right = CreateDefaultSubobject<USZMotionHandController>(TEXT("Motion_R"));
+	MotionController_Right->SetCollisionProfileName(TEXT("NoCollision"));
+	MotionController_Right->MotionSource = FXRMotionControllerBase::RightHandSourceId; // 블루프린트는 Enum 형식이라 참 쉽더라
+
+	FTransform OriginTransform = FTransform(FRotator(0.0f, 0.0f, 0.0f), FVector(0.f, 0.f, 0.0f), FVector(1.f, 1.f, 1.f));
+
+	VR_Origin->SetWorldTransform(OriginTransform);
+	VR_Origin->SetupAttachment(RootComponent);
+
+
+	MotionController_Left->SetupAttachment(VR_Origin);
+	MotionController_Right->SetupAttachment(VR_Origin);
+	// 메시정보를 가져와 적절한 위치에 포지션 및 로테이트 배치
+	GetMesh()->SetRelativeLocationAndRotation(FVector(20.0f, 0.0f, -88.0f), FRotator(0.0f, -90.0f, 0.0f));
+
+	SpringArm->SetupAttachment(VR_Origin);
+	Camera->SetupAttachment(SpringArm);
+
+	SpringArm->TargetArmLength = 0;
+	SpringArm->SetRelativeRotation(FRotator(0.0f, 0.0f, 0.0f));
+
+	VR_MuzzleLocation = CreateDefaultSubobject<USceneComponent>(TEXT("VR_MuzzleLocation"));
+	//VR_MuzzleLocation->SetupAttachment(MotionController_Right);
+	VR_MuzzleLocation->SetRelativeLocation(FVector(0.000004, 53.999992, 10.000000));
+	VR_MuzzleLocation->SetRelativeRotation(FRotator(0.0f, 90.0f, 0.0f));
+	
+
+	eAnimCharacter = ETestEnum::Idle;
+	IsGrab = false;
+
+
+	// 테스트용임! 스켈레탈메시 로드가 잘 되는지만 보는거임.
+	auto DefaultSetting = GetDefault<USZCharacterListSetting>();
+
+	if (DefaultSetting->ZombieChracterSetting.Num() > 0)
+	{
+		for (auto ZombieAsset : DefaultSetting->ZombieChracterSetting)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Test Character Asset Load : %s"), *ZombieAsset.ToString());
+		}
+
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("Test Character Asset Not Load"));
+	}
+}
+
+// Called when the game starts or when spawned
+void ASZCharacter::BeginPlay()
+{
+	Super::BeginPlay();
+
+	bUsingMotionControllers = UHeadMountedDisplayFunctionLibrary::IsHeadMountedDisplayEnabled();
+
+
+	if (bUsingMotionControllers) // 현재 VR모드가 사용중이면
+	{
+		const FTransform SpawnTransform = FTransform(FRotator(0.0f, -20.0f, 0.0f), FVector(10.0f, 0.0f, -5.0f), FVector(1.0f, 1.0f, 1.0f)); // = FTransform::Identity;
+		SpringArm->SetRelativeTransform(SpawnTransform);
+
+		bEquipWeapon = false;
+	}
+	else // 일반 상황이라면
+	{
+		const FTransform SpawnTransform = FTransform(FRotator(0.0f, -20.0f, 0.0f), FVector(-120.0f, 0.0f, .0f), FVector(1.0f, 1.0f, 1.0f)); // = FTransform::Identity;
+		SpringArm->SetRelativeTransform(SpawnTransform);
+
+		if (WeaponType != nullptr)
+		{
+			WeaponTest = GetWorld()->SpawnActor<ASZWeaponBase>(WeaponType, TTPMesh->GetSocketTransform(TEXT("WeaponHand_r")));
+			
+			//WeaponTest->AttachToComponent(TTPMesh, FAttachmentTransformRules (EAttachmentRule::SnapToTarget, false), TEXT("WeaponHand_r"));
+
+
+			FName WeaponSocketName = TEXT("WeaponHand_r");
+			WeaponTest->AttachToActor(this, FAttachmentTransformRules::SnapToTargetIncludingScale, WeaponSocketName);
+		}
+		bEquipWeapon = true;
+	}
+
+	WeaponTest->SetOwningPawn(this);
+}
+
+void ASZCharacter::PostInitializeComponents()
+{
+	Super::PostInitializeComponents();
+
+	if (Role == ROLE_Authority)
+	{
+		Health = GetMaxHealth();
+	}
+
+
+}
+
+// Called every frame
+void ASZCharacter::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+	switch (eAnimCharacter)
+	{
+	case ETestEnum::Idle:
+		IdleState();
+		break;
+	case ETestEnum::Move:
+		MoveState();
+		break;
+	case ETestEnum::Attack:
+		AttackState();
+		break;
+	case ETestEnum::Death:
+		DeathState();
+		break;
+	case ETestEnum::Hit:
+		HitState();
+		break;
+	case ETestEnum::Interaction:
+		InteractionState();
+		break;
+	case ETestEnum::Reload:
+		ReloadState();
+		break;
+	default:
+		break;
+	}
+}
+
+// Called to bind functionality to input
+void ASZCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+{
+	Super::SetupPlayerInputComponent(PlayerInputComponent);
+
+	PlayerInputComponent->BindAxis(TEXT("MoveForward"), this, &ASZCharacter::MoveForward);
+	PlayerInputComponent->BindAxis(TEXT("MoveRight"), this, &ASZCharacter::MoveRight);
+	PlayerInputComponent->BindAxis(TEXT("CameraX"), this, &ASZCharacter::CameraX);
+	PlayerInputComponent->BindAxis(TEXT("CameraY"), this, &ASZCharacter::CameraY);
+
+	PlayerInputComponent->BindAction(TEXT("Fire"), IE_Pressed, this, &ASZCharacter::DoFire);
+	PlayerInputComponent->BindAction(TEXT("Fire"), IE_Released, this, &ASZCharacter::UnFire);
+
+	PlayerInputComponent->BindAction(TEXT("Reload"), IE_Pressed, this, &ASZCharacter::DoReload);
+	PlayerInputComponent->BindAction(TEXT("Reload"), IE_Released, this, &ASZCharacter::UnReload);
+
+	// 왼손 오른손 집기 함수. 추후에 한손만 집게 삭제하던가, 양손 구분없이 동일하게 작동하도록 만들겠음.
+	PlayerInputComponent->BindAction(TEXT("GrabL"), IE_Pressed, this, &ASZCharacter::GrabActorL);
+	PlayerInputComponent->BindAction(TEXT("GrabR"), IE_Pressed, this, &ASZCharacter::GrabActorR);
+	PlayerInputComponent->BindAction(TEXT("GrabL"), IE_Released, this, &ASZCharacter::UnGrabActorL);
+	PlayerInputComponent->BindAction(TEXT("GrabR"), IE_Released, this, &ASZCharacter::UnGrabActorR);
+}
+
+bool ASZCharacter::IsAlive() const
+{
+	return Health > 0;
+}
+
+bool ASZCharacter::IsEnemyFor(AController * TestPC) const
+{
+	if (TestPC == Controller || TestPC == NULL)
+	{
+		return false;
+	}
+
+	ASZPlayerState* TestPlayerState = Cast<ASZPlayerState>(TestPC->PlayerState);
+	ASZPlayerState* MyPlayerState = Cast<ASZPlayerState>(GetPlayerState());
+
+	bool bIsEnemy = true;
+	if (GetWorld()->GetGameState())
+	{
+		const ASZGameMode* DefGame = GetWorld()->GetGameState()->GetDefaultGameMode<ASZGameMode>();
+		if (DefGame && MyPlayerState && TestPlayerState)
+		{
+			bIsEnemy = DefGame->CanDealDamage(TestPlayerState, MyPlayerState);
+		}
+	}
+
+	return bIsEnemy;
+}
+
+int32 ASZCharacter::GetMaxHealth() const
+{
+	return GetClass()->GetDefaultObject<ASZCharacter>()->Health;
+}
+
+void ASZCharacter::EquipWeapon(ASZWeaponBase * WeaponActor)
+{
+	WeaponActor->GetWeaponMesh()->SetSimulatePhysics(false);
+	FAttachmentTransformRules AttachmentTransformRules(EAttachmentRule::KeepWorld, false);
+	WeaponActor->AttachToComponent(MotionController_Right, AttachmentTransformRules);
+	WeaponActor->SetActorRelativeLocation(FVector(0.0f, 0.0f, 0.0f));
+	WeaponActor->SetActorRelativeRotation(FRotator(0.0f, 0.0f, 0.0f));
+
+	//WeaponActor->AttachToComponent(TTPMesh, AttachmentTransformRules, TEXT("WeaponHand_R"));
+}
+
+// 이동관련 처리.
+void ASZCharacter::MoveForward(float flAxisValue)
+{
+	// 캐릭터 로테이션에서 추가적으로 회전값을 add 해줌
+	AddMovementInput(GetActorForwardVector(), flAxisValue);
+	//AddMovementInput(FRotationMatrix(GetControlRotation()).GetUnitAxis(EAxis::X), flAxisValue);
+	MoveAnimSpeed = flAxisValue;
+	if (flAxisValue != 0)
+	{
+		eAnimCharacter = ETestEnum::Move;
+	}
+}
+
+void ASZCharacter::MoveRight(float flAxisValue)
+{
+	// 캐릭터 로테이션에서 추가적으로 회전값을 add 해줌
+	AddMovementInput(GetActorRightVector(), flAxisValue);
+	//AddMovementInput(FRotationMatrix(GetControlRotation()).GetUnitAxis(EAxis::Y), flAxisValue);
+	if (flAxisValue != 0)
+	{
+		eAnimCharacter = ETestEnum::Move;
+	}
+}
+
+void ASZCharacter::CameraX(float flAxisValue)
+{
+	AddControllerPitchInput(flAxisValue);
+}
+
+void ASZCharacter::DoFire()
+{
+	// 공격중 이동에 대한 고려가 안되어있기 때문에 추후 추가되야함.
+	eAnimCharacter = ETestEnum::Attack;
+
+		UWorld* const World = GetWorld();
+		if (World != NULL)
+		{
+			//if (bUsingMotionControllers) // 현재 VR모드가 사용중이면
+			//{
+			//	if (ProjectileClass != NULL)
+			//	{
+			//		const FRotator SpawnRotation = VR_MuzzleLocation->GetComponentRotation();
+			//		const FVector SpawnLocation = VR_MuzzleLocation->GetComponentLocation();
+			//		World->SpawnActor<ASZProjectile>(ProjectileClass, SpawnLocation, SpawnRotation);
+			//	}
+			//}
+			//else // 일반 상황이라면
+			//{
+			//	// 이거는 그냥 프로젝타일 쏘는건데
+			//	if (ProjectileClass != NULL)
+			//	{
+			//		const FRotator SpawnRotation = WeaponTest->GetWeaponMesh()->GetSocketRotation(WeaponTest->MuzzleAttachPoint);
+			//		const FVector SpawnLocation = WeaponTest->GetWeaponMesh()->GetSocketLocation(WeaponTest->MuzzleAttachPoint);
+			//		World->SpawnActor<ASZProjectile>(ProjectileClass, SpawnLocation, SpawnRotation);
+			//	}
+			//}
+		}
+		WeaponTest->StartFire();
+}
+
+void ASZCharacter::UnFire()
+{
+	// 공격중 이동에 대한 고려가 안되어있기 때문에 추후 추가되야함.
+	if (GetCharacterMovement()->Velocity.Size() <= 0) // 이동속도가 0이 되면 더이상 진입하지 않음.
+	{
+		eAnimCharacter = ETestEnum::Idle;
+	}
+	else
+	{
+		eAnimCharacter = ETestEnum::Attack;
+	}
+	WeaponTest->StopFire();
+}
+
+void ASZCharacter::DoReload()
+{
+	// 1회 입력에 대한 처리가 필요함. 추후 변경예정
+	eAnimCharacter = ETestEnum::Reload;
+}
+
+void ASZCharacter::UnReload()
+{
+	eAnimCharacter = ETestEnum::Idle;
+}
+
+void ASZCharacter::CameraY(float flAxisValue)
+{
+	AddControllerPitchInput(flAxisValue);
+}
+
+void ASZCharacter::IdleState()
+{
+	// 대기상태에 관한 처리.
+}
+
+void ASZCharacter::MoveState()
+{
+	float MoveSpeed;
+	MoveSpeed = GetCharacterMovement()->Velocity.Size();
+	if (MoveSpeed <= 0) // 이동속도가 0이 되면 더이상 진입하지 않음.
+	{
+		eAnimCharacter = ETestEnum::Idle;
+	}
+}
+
+void ASZCharacter::AttackState()
+{
+	// 공격에 관한 처리. 프로젝타일 생성해서 쏴야함.
+}
+
+void ASZCharacter::DeathState()
+{
+	// 사망 처리.체력정보 추가 필요
+}
+
+void ASZCharacter::HitState()
+{
+	// 피격에 관한 처리.
+}
+
+void ASZCharacter::InteractionState()
+{
+	// 상호작용에 관한 처리.
+}
+
+void ASZCharacter::ReloadState()
+{
+	// 재장전에 대한 처리.
+}
+
+float ASZCharacter::PlayAnimMontage(UAnimMontage * AnimMontage, float InPlayRate, FName StartSectionName)
+{
+	return 0.0f;
+}
+
+void ASZCharacter::StopAnimMontage(UAnimMontage * AnimMontage)
+{
+}
+
+void ASZCharacter::GrabActorL()
+{
+	MotionController_Left->GrabActor();
+}
+
+void ASZCharacter::GrabActorR()
+{
+	MotionController_Right->GrabActor();
+}
+
+void ASZCharacter::UnGrabActorL()
+{
+	MotionController_Left->UnGrabActor();
+}
+
+void ASZCharacter::UnGrabActorR()
+{
+	MotionController_Right->UnGrabActor();
+}
+
+void ASZCharacter::Interaction()
+{
+
+}
+
+/////////////////////// replication
+void ASZCharacter::GetLifetimeReplicatedProps(TArray< FLifetimeProperty > & OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	DOREPLIFETIME(ASZCharacter, Health);
+}
